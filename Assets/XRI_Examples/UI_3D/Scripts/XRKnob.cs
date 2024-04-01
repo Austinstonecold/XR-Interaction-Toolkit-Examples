@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine.Events;
 using UnityEngine.XR.Interaction.Toolkit;
+using UnityEngine.UI;
+using TMPro;
 
 namespace UnityEngine.XR.Content.Interaction
 {
@@ -118,7 +121,7 @@ namespace UnityEngine.XR.Content.Interaction
         [Tooltip("Events to trigger when the knob is rotated")]
         ValueChangeEvent m_OnValueChange = new ValueChangeEvent();
 
-        IXRSelectInteractor m_Interactor;
+        public List<IXRSelectInteractor> m_Interactors = new List<IXRSelectInteractor>(); //Now is handles multiple interactors at once instead of just 1
 
         bool m_PositionDriven = false;
         bool m_UpVectorDriven = false;
@@ -214,19 +217,23 @@ namespace UnityEngine.XR.Content.Interaction
 
         void StartGrab(SelectEnterEventArgs args)
         {
-            m_Interactor = args.interactorObject;
+            m_Interactors.Add(args.interactorObject);
 
-            m_PositionAngles.Reset();
-            m_UpVectorAngles.Reset();
-            m_ForwardVectorAngles.Reset();
+            // Reset tracked rotations only if this is the first interactor
+            if (m_Interactors.Count == 1)
+            {
+                m_PositionAngles.Reset();
+                m_UpVectorAngles.Reset();
+                m_ForwardVectorAngles.Reset();
+                UpdateBaseKnobRotation();
+            }
 
-            UpdateBaseKnobRotation();
             UpdateRotation(true);
         }
 
         void EndGrab(SelectExitEventArgs args)
         {
-            m_Interactor = null;
+            m_Interactors.Remove(args.interactorObject);
         }
 
         public override void ProcessInteractable(XRInteractionUpdateOrder.UpdatePhase updatePhase)
@@ -239,83 +246,112 @@ namespace UnityEngine.XR.Content.Interaction
                 {
                     UpdateRotation();
                 }
+                else
+                {
+                    // Sets the value of the wheel to .5 when not grabbed
+                    const float smoothingFactor = 0.1f; // Adjust the smoothing factor as needed (lower = slower)
+                    float targetValue = 0.5f;
+
+                    // Smoothly interpolate the current value towards the target value
+                    float smoothedValue = Mathf.Lerp(m_Value, targetValue, smoothingFactor);
+
+                    // Set the smoothed value
+                    SetValue(smoothedValue);
+                    SetKnobRotation(ValueToRotation());
+                }
             }
         }
 
         void UpdateRotation(bool freshCheck = false)
         {
-            // Are we in position offset or direction rotation mode?
-            var interactorTransform = m_Interactor.GetAttachTransform(this);
+            //Now allows for both single and two-hand grabbing
+            // Reset tracked rotations if no interactors are grabbing
+            if (m_Interactors.Count == 0)
+            {
+                m_PositionAngles.Reset();
+                m_UpVectorAngles.Reset();
+                m_ForwardVectorAngles.Reset();
+            }
 
-            // We cache the three potential sources of rotation - the position offset, the forward vector of the controller, and up vector of the controller
-            // We store any data used for determining which rotation to use, then flatten the vectors to the local xz plane
-            var localOffset = transform.InverseTransformVector(interactorTransform.position - m_Handle.position);
-            localOffset.y = 0.0f;
-            var radiusOffset = transform.TransformVector(localOffset).magnitude;
-            localOffset.Normalize();
+            // Combine rotations from all interactors
+            Vector3 combinedOffset = Vector3.zero;
+            Vector3 combinedForward = Vector3.zero;
+            Vector3 combinedUp = Vector3.zero;
 
-            var localForward = transform.InverseTransformDirection(interactorTransform.forward);
-            var localY = Math.Abs(localForward.y);
-            localForward.y = 0.0f;
-            localForward.Normalize();
+            foreach (var interactor in m_Interactors)
+            {
+                var interactorTransform = interactor.GetAttachTransform(this);
 
-            var localUp = transform.InverseTransformDirection(interactorTransform.up);
-            localUp.y = 0.0f;
-            localUp.Normalize();
+                // We cache the three potential sources of rotation - the position offset, the forward vector of the controller, and up vector of the controller
+                // We store any data used for determining which rotation to use, then flatten the vectors to the local xz plane
+                var localOffset = transform.InverseTransformVector(interactorTransform.position - m_Handle.position);
+                localOffset.y = 0.0f;
+                localOffset.Normalize();
 
+                var localForward = transform.InverseTransformDirection(interactorTransform.forward);
+                var localY = Math.Abs(localForward.y);
+                localForward.y = 0.0f;
+                localForward.Normalize();
 
-            if (m_PositionDriven && !freshCheck)
-                radiusOffset *= (1.0f + k_ModeSwitchDeadZone);
+                var localUp = transform.InverseTransformDirection(interactorTransform.up);
+                localUp.y = 0.0f;
+                localUp.Normalize();
 
-            // Determine when a certain source of rotation won't contribute - in that case we bake in the offset it has applied
-            // and set a new anchor when they can contribute again
+                combinedOffset += localOffset;
+                combinedForward += localForward;
+                combinedUp += localUp;
+            }
+
+            combinedOffset /= m_Interactors.Count;
+            combinedForward /= m_Interactors.Count;
+            combinedUp /= m_Interactors.Count;
+
+            var radiusOffset = combinedOffset.magnitude;
+            float combinedLocalY = Vector3.Dot(combinedForward, Vector3.up);
+
+            bool positionDriven = false;
+            bool upVectorDriven = false;
+
             if (radiusOffset >= m_PositionTrackedRadius)
             {
+                positionDriven = true;
                 if (!m_PositionDriven || freshCheck)
                 {
-                    m_PositionAngles.SetBaseFromVector(localOffset);
-                    m_PositionDriven = true;
+                    m_PositionAngles.SetBaseFromVector(combinedOffset);
                 }
+                m_PositionAngles.SetTargetFromVector(combinedOffset);
             }
-            else
-                m_PositionDriven = false;
 
-            // If it's not a fresh check, then we weight the local Y up or down to keep it from flickering back and forth at boundaries
             if (!freshCheck)
             {
                 if (!m_UpVectorDriven)
-                    localY *= (1.0f - (k_ModeSwitchDeadZone * 0.5f));
+                    combinedLocalY *= (1.0f - (k_ModeSwitchDeadZone * 0.5f));
                 else
-                    localY *= (1.0f + (k_ModeSwitchDeadZone * 0.5f));
+                    combinedLocalY *= (1.0f + (k_ModeSwitchDeadZone * 0.5f));
             }
 
-            if (localY > 0.707f)
+            if (combinedLocalY > 0.707f)
             {
+                upVectorDriven = true;
                 if (!m_UpVectorDriven || freshCheck)
                 {
-                    m_UpVectorAngles.SetBaseFromVector(localUp);
-                    m_UpVectorDriven = true;
+                    m_UpVectorAngles.SetBaseFromVector(combinedUp);
                 }
+                m_UpVectorAngles.SetTargetFromVector(combinedUp);
             }
             else
             {
                 if (m_UpVectorDriven || freshCheck)
                 {
-                    m_ForwardVectorAngles.SetBaseFromVector(localForward);
-                    m_UpVectorDriven = false;
+                    m_ForwardVectorAngles.SetBaseFromVector(combinedForward);
                 }
+                m_ForwardVectorAngles.SetTargetFromVector(combinedForward);
             }
 
-            // Get angle from position
-            if (m_PositionDriven)
-                m_PositionAngles.SetTargetFromVector(localOffset);
+            m_PositionDriven = positionDriven;
+            m_UpVectorDriven = upVectorDriven;
 
-            if (m_UpVectorDriven)
-                m_UpVectorAngles.SetTargetFromVector(localUp);
-            else
-                m_ForwardVectorAngles.SetTargetFromVector(localForward);
-
-            // Apply offset to base knob rotation to get new knob rotation
+            // Apply combined rotations to the knob
             var knobRotation = m_BaseKnobRotation - ((m_UpVectorAngles.totalOffset + m_ForwardVectorAngles.totalOffset) * m_TwistSensitivity) - m_PositionAngles.totalOffset;
 
             // Clamp to range
@@ -422,4 +458,4 @@ namespace UnityEngine.XR.Content.Interaction
             SetKnobRotation(ValueToRotation());
         }
     }
-}
+} 
